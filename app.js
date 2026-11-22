@@ -3,6 +3,9 @@ const app = document.getElementById("app");
 const nav = document.getElementById("chapnav");
 const bar = document.getElementById("progressbar");
 const byId = Object.fromEntries(CHAPTERS.map(c => [c.id, c]));
+// stable ids ("c2:7") so saved progress can find its questions again
+const QID = {};
+CHAPTERS.forEach(c => c.quiz.forEach((q, k) => { q.id = c.id + ":" + k; QID[q.id] = { q, from: c.num }; }));
 
 /* ---------- helpers ---------- */
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -32,6 +35,12 @@ document.addEventListener("click", e => {
 });
 
 /* ---------- home ---------- */
+function progressText(key) {
+  const s = store.get("quiz:" + key);
+  if (!s || !Array.isArray(s.items) || s.i >= s.items.length) return "";
+  const answered = s.items.filter(x => x.done).length;
+  return answered ? `In progress: ${answered} of ${s.items.length} answered` : "";
+}
 function home() {
   setAccent(null); renderNav(null);
   app.innerHTML = `
@@ -42,21 +51,24 @@ function home() {
   <div class="grid">
     ${CHAPTERS.map(c => {
       const best = store.get("best:" + c.id);
+      const prog = progressText(c.id);
       return `<article class="card" style="--cc:var(${c.color})">
         <span class="num">${c.num}</span>
         <h2>${c.title}</h2>
         <p>${c.blurb}</p>
         <span class="best">${c.quiz.filter(q => q.t !== "written").length} quiz questions · ${best != null ? "best " + best + "%" : "not tried yet"}</span>
+        ${prog ? `<span class="best inprog">${prog}</span>` : ""}
         <div class="btns">
           <button class="btn" data-go="${c.id}/notes">Read notes</button>
-          <button class="btn ghost" data-go="${c.id}/quiz">Questions</button>
+          <button class="btn ghost" data-go="${c.id}/quiz">${prog ? "Continue questions" : "Questions"}</button>
         </div>
       </article>`;
     }).join("")}
   </div>
   <div class="mock">
-    <div><h3>Mock exam: all chapters</h3><p>25 random questions from Chapters 1–4, Java questions included. Explanations are shown at the end.</p></div>
-    <button class="btn" style="--cc:var(--c1)" data-go="mock">Start mock exam</button>
+    <div><h3>Mock exam: all chapters</h3><p>25 random questions from Chapters 1–4, Java questions included. Each answer comes with an explanation.</p>
+      ${progressText("mock") ? `<span class="best inprog">${progressText("mock")}</span>` : ""}</div>
+    <button class="btn" style="--cc:var(--c1)" data-go="mock">${progressText("mock") ? "Continue mock exam" : "Start mock exam"}</button>
   </div>`;
 }
 
@@ -155,6 +167,35 @@ function startQuiz(title, list, key, c, filter = "all") {
   Q = { title, all: list, key, c, filter, items: pool.map(prep), i: 0 };
   renderQuiz();
 }
+
+/* ---------- saved progress ---------- */
+const SAVE_FIELDS = ["done", "correct", "pick", "order", "pool", "built", "draft"];
+function saveProgress() {
+  if (!Q || !Q.items.length) return;
+  store.set("quiz:" + Q.key, {
+    filter: Q.filter, i: Q.i, retry: !!Q.retry,
+    all: Q.key === "mock" ? Q.all.map(q => q.id) : null,
+    items: Q.items.map(it => {
+      const s = { id: it.q.id };
+      SAVE_FIELDS.forEach(f => { if (it[f] !== undefined) s[f] = it[f]; });
+      return s;
+    })
+  });
+}
+function clearProgress(key) { store.set("quiz:" + key, null); }
+function withFrom(id) { const e = QID[id]; return e && { ...e.q, from: e.from }; }
+// returns true if a saved, unfinished session was restored
+function resumeQuiz(title, key, c) {
+  const s = store.get("quiz:" + key);
+  if (!s || !Array.isArray(s.items) || s.i >= s.items.length) return false;
+  if (!s.items.every(x => QID[x.id])) { clearProgress(key); return false; }  // questions changed since save
+  const get = id => key === "mock" ? withFrom(id) : QID[id].q;
+  const items = s.items.map(x => { const it = prep(get(x.id)); SAVE_FIELDS.forEach(f => { if (x[f] !== undefined) it[f] = x[f]; }); return it; });
+  const all = key === "mock" ? (s.all || []).filter(id => QID[id]).map(get) : c.quiz;
+  Q = { title, all, key, c, filter: s.filter || "all", items, i: s.i, retry: s.retry, resumed: true };
+  renderQuiz();
+  return true;
+}
 function prep(q) {
   const item = { q, done: false, correct: null };
   if (q.t === "mcq") item.order = shuffle(q.o.map((_, i) => i));
@@ -168,10 +209,11 @@ function prep(q) {
 
 function quizPage(c) {
   setAccent(c); renderNav(c.id);
-  startQuiz(c.num + " questions", c.quiz, c.id, c);
+  if (!resumeQuiz(c.num + " questions", c.id, c)) startQuiz(c.num + " questions", c.quiz, c.id, c);
 }
-function mockPage() {
+function mockPage(fresh) {
   setAccent(null); renderNav("mock");
+  if (!fresh && resumeQuiz("Mock exam", "mock", null)) return;
   const all = CHAPTERS.flatMap(c => c.quiz.filter(q => q.t !== "written").map(q => ({ ...q, from: c.num })));
   startQuiz("Mock exam", shuffle(all).slice(0, 25), "mock", null);
 }
@@ -179,6 +221,7 @@ function mockPage() {
 function renderQuiz() {
   const { items, i, c } = Q;
   bar.style.width = "0";
+  if (i < items.length) saveProgress();
   if (!items.length) { app.innerHTML = header() + `<p>No questions match this filter.</p>`; return; }
   if (i >= items.length) return renderResult();
   const it = items[i], q = it.q;
@@ -246,7 +289,9 @@ function header() {
     ? `<div class="chead"><span class="num">${c.num}</span><h1>${c.title}</h1></div>
        <div class="tabs"><button class="btn ghost" data-go="${c.id}/notes">← Notes</button><button class="btn" data-go="${c.id}/quiz">Questions</button></div>`
     : `<div class="chead"><span class="num">All chapters</span><h1>Mock exam</h1><p>25 random questions. Explanations appear after each answer.</p></div>`;
-  return top + `<div class="qtop">${chips}<span class="meta">Question ${Math.min(i + 1, items.length)} / ${items.length} · score ${score}/${answered}</span></div>`;
+  const resumed = Q.resumed && i < items.length
+    ? `<div class="resume"><span>Picked up where you left off. Your progress is saved automatically.</span><button class="chip" data-act="restart">Start over</button></div>` : "";
+  return top + resumed + `<div class="qtop">${chips}<span class="meta">Question ${Math.min(i + 1, items.length)} / ${items.length} · score ${score}/${answered}</span></div>`;
 }
 
 function finish(it, ok) { it.done = true; it.correct = ok; renderQuiz(); }
@@ -270,19 +315,28 @@ app.addEventListener("click", e => {
   if (act === "next") { Q.i++; renderQuiz(); window.scrollTo(0, 0); }
   if (act === "prev") { Q.i = Math.max(0, Q.i - 1); renderQuiz(); }
   if (act === "retry") { startQuiz(Q.title, Q.all, Q.key, Q.c, Q.filter); }
+  if (act === "restart") {
+    if (!confirm("Start over? Your answers in this quiz will be cleared.")) return;
+    clearProgress(Q.key);
+    if (Q.key === "mock") mockPage(true); else startQuiz(Q.title, Q.c.quiz, Q.key, Q.c, Q.filter);
+  }
   if (act === "retrywrong") {
     const wrong = Q.items.filter(x => x.q.t !== "written" && !x.correct).map(x => x.q);
-    Q = { ...Q, items: shuffle(wrong).map(prep), i: 0 }; renderQuiz();
+    Q = { ...Q, items: shuffle(wrong).map(prep), i: 0, retry: true, resumed: false }; renderQuiz();
   }
-  if (act === "newmock") mockPage();
+  if (act === "newmock") mockPage(true);
 });
-app.addEventListener("input", e => { if (Q && e.target.matches("textarea.written")) Q.items[Q.i].draft = e.target.value; });
+app.addEventListener("input", e => {
+  if (Q && e.target.matches("textarea.written")) { Q.items[Q.i].draft = e.target.value; saveProgress(); }
+});
 
 function renderResult() {
   const scored = Q.items.filter(x => x.q.t !== "written");
   const right = scored.filter(x => x.correct).length;
   const pct = scored.length ? Math.round(right / scored.length * 100) : 0;
-  if (scored.length) { const prev = store.get("best:" + Q.key); if (prev == null || pct > prev) store.set("best:" + Q.key, pct); }
+  clearProgress(Q.key);   // finished, so next visit starts a fresh attempt
+  // a retry of only the wrong ones isn't a full attempt, so it doesn't count as a best score
+  if (scored.length && !Q.retry) { const prev = store.get("best:" + Q.key); if (prev == null || pct > prev) store.set("best:" + Q.key, pct); }
   const msg = pct >= 85 ? "Exam ready. Nice." : pct >= 65 ? "Solid, but tidy up the ones below." : "Re-read the notes, then try again.";
   const wrong = scored.filter(x => !x.correct);
   app.innerHTML = header() + `
